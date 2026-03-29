@@ -228,7 +228,12 @@ build/              应用图标与打包资源
 
 ## 加入社区
 
-- **飞书开放群** — 二维码扫码加入
+- **Qclaw开源交流群**
+
+<p>
+  <img src="docs/images/feishu_qrcode.png" alt="Qclaw开源交流群二维码" height="180">
+</p>
+
 
 ### 社区规范
 [社区行为准则](https://e1wb2qdopt6.feishu.cn/wiki/Y1luwaPAnioolOktXtgcMwTUnif)
