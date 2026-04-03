@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
-import { Button, Card, Badge, ScrollArea, Modal, Group, Text, Loader, Alert, Select } from '@mantine/core'
+import { Button, Card, Badge, ScrollArea, Modal, Group, Text, Loader, Alert, Select, TextInput } from '@mantine/core'
 import { getChannelDefinition, removeWeixinChannelAccountConfig } from '../lib/openclaw-channel-registry'
 import { createPageDataCache } from '../lib/page-data-cache'
 import ChannelConnect, { type ChannelConnectNextPayload } from './ChannelConnect'
@@ -32,6 +32,7 @@ import {
   getOfficialChannelStageLabel,
 } from '../shared/official-channel-status-view'
 import { runManagedChannelRepairFlow } from '../shared/managed-channel-repair'
+import ChannelCard from '../components/ChannelCard'
 import { resolveManagedChannelIdentity } from '../shared/managed-channel-identity'
 import { getManagedChannelPluginByChannelId } from '../shared/managed-channel-plugin-registry'
 import { readOpenClawUpstreamModelState } from '../shared/upstream-model-state'
@@ -41,6 +42,7 @@ interface ChannelInfo {
   channelId: string
   configChannelId: string
   name: string
+  displayName: string
   platform: string
   enabled: boolean
   credentials: Record<string, string>
@@ -116,6 +118,28 @@ export function shouldReuseModelOptionsCache(options?: {
 const CHANNELS_PAGE_CACHE_TTL_MS = 60 * 1000
 const channelsPageCache = createPageDataCache<ChannelsPageSnapshot>({ ttlMs: CHANNELS_PAGE_CACHE_TTL_MS })
 
+const BOT_DISPLAY_NAMES_KEY = 'qclaw-bot-display-names'
+
+function loadBotDisplayNames(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(BOT_DISPLAY_NAMES_KEY)
+    if (raw) return JSON.parse(raw) as Record<string, string>
+  } catch { /* ignore */ }
+  return {}
+}
+
+function saveBotDisplayName(channelId: string, name: string): void {
+  const names = loadBotDisplayNames()
+  names[channelId] = name
+  localStorage.setItem(BOT_DISPLAY_NAMES_KEY, JSON.stringify(names))
+}
+
+function removeBotDisplayName(channelId: string): void {
+  const names = loadBotDisplayNames()
+  delete names[channelId]
+  localStorage.setItem(BOT_DISPLAY_NAMES_KEY, JSON.stringify(names))
+}
+
 export default function ChannelsPage() {
   const initialSnapshotRef = useRef<ChannelsPageSnapshot | null>(channelsPageCache.get()?.data || null)
   const initialSnapshot = initialSnapshotRef.current
@@ -137,6 +161,9 @@ export default function ChannelsPage() {
   const [showModelModal, setShowModelModal] = useState(false)
   const [selectedModelChannel, setSelectedModelChannel] = useState<ChannelInfo | null>(null)
   const [modelOptions, setModelOptions] = useState<ModelSelectOption[]>([])
+  const [showRenameModal, setShowRenameModal] = useState(false)
+  const [renamingChannel, setRenamingChannel] = useState<ChannelInfo | null>(null)
+  const [renameValue, setRenameValue] = useState('')
   const [selectedModelValue, setSelectedModelValue] = useState<string | null>(null)
   const [currentRuntimeModel, setCurrentRuntimeModel] = useState('')
   const [modelModalError, setModelModalError] = useState('')
@@ -227,6 +254,7 @@ export default function ChannelsPage() {
               channelId: 'feishu',
               configChannelId: 'feishu',
               name: bot.name,
+              displayName: '',
               accountName: bot.name,
               platform: 'feishu',
               enabled: bot.enabled,
@@ -251,6 +279,7 @@ export default function ChannelsPage() {
               channelId: 'feishu',
               configChannelId: 'feishu',
               name: bot.name,
+              displayName: '',
               accountName: bot.name,
               platform: 'feishu',
               enabled: bot.enabled,
@@ -301,6 +330,7 @@ export default function ChannelsPage() {
             channelId: 'openclaw-weixin',
             configChannelId: 'openclaw-weixin',
             name: String(configEntry?.name || state?.name || accountId).trim() || accountId,
+            displayName: '',
             accountName: String(configEntry?.name || state?.name || accountId).trim() || accountId,
             platform: 'openclaw-weixin',
             enabled,
@@ -339,6 +369,7 @@ export default function ChannelsPage() {
           channelId: identity.channelId,
           configChannelId: identity.configChannelId,
           name: channelConfig.name || channelDef?.name || identity.channelId || id,
+          displayName: '',
           platform: identity.platform,
           enabled: channelConfig.enabled !== false,
           credentials: channelConfig.credentials || {},
@@ -349,6 +380,12 @@ export default function ChannelsPage() {
           pairingAccountId: undefined,
           pluginStatus,
         })
+      }
+
+      // Assign display names: use custom name from localStorage, or default sequential name
+      const customNames = loadBotDisplayNames()
+      for (let i = 0; i < channelList.length; i++) {
+        channelList[i].displayName = customNames[channelList[i].id] || `机器人 ${i + 1}`
       }
 
       setChannels(channelList)
@@ -548,7 +585,7 @@ export default function ChannelsPage() {
   }
 
   const handleRemoveChannel = async (channel: ChannelInfo) => {
-    if (!confirm(`确定要删除 ${channel.name} 吗？`)) return
+    if (!confirm(`确定要删除 ${channel.displayName} 吗？`)) return
     try {
       const config = sanitizeFeishuPluginConfig(await window.api.readConfig())
       if (config) {
@@ -581,6 +618,7 @@ export default function ChannelsPage() {
         if (!writeResult.ok) {
           throw new Error(writeResult.message || '配置文件写入失败')
         }
+        removeBotDisplayName(channel.id)
         await fetchChannels({ background: true })
       }
     } catch (e) {
@@ -676,6 +714,26 @@ export default function ChannelsPage() {
     }
   }
 
+  const handleOpenRename = (channel: ChannelInfo) => {
+    setRenamingChannel(channel)
+    setRenameValue(channel.displayName)
+    setShowRenameModal(true)
+  }
+
+  const handleConfirmRename = () => {
+    if (!renamingChannel) return
+    const trimmed = renameValue.trim()
+    if (!trimmed) return
+    saveBotDisplayName(renamingChannel.id, trimmed)
+    setChannels((prev) =>
+      prev.map((ch) =>
+        ch.id === renamingChannel.id ? { ...ch, displayName: trimmed } : ch
+      )
+    )
+    setShowRenameModal(false)
+    setRenamingChannel(null)
+  }
+
   const getPlatformInfo = (channelId: string, platform: string) => {
     const channelDef = getChannelDefinition(platform) || getChannelDefinition(channelId)
     return {
@@ -752,155 +810,21 @@ export default function ChannelsPage() {
               const togglingAnyChannel = Boolean(togglingChannelId)
               const togglingAnotherChannel = Boolean(togglingChannelId && togglingChannelId !== channel.id)
               return (
-                <Card
+                <ChannelCard
                   key={channel.id}
-                  padding="lg"
-                  withBorder
-                  className={`transition-colors duration-200 ${
-                    channel.pairingRequired ? 'cursor-pointer' : ''
-                  }`}
-                  style={channel.pairingRequired ? { '--hover-bg': 'var(--app-bg-tertiary)' } as React.CSSProperties : undefined}
-                  onMouseEnter={(e) => {
-                    if (channel.pairingRequired) e.currentTarget.style.backgroundColor = 'var(--app-bg-tertiary)'
-                  }}
-                  onMouseLeave={(e) => {
-                    if (channel.pairingRequired) e.currentTarget.style.backgroundColor = ''
-                  }}
-                  onClick={channel.pairingRequired ? () => handleOpenPairing(channel) : undefined}
-                >
-                  <Group justify="space-between" align="flex-start">
-                    <Group gap="md" align="flex-start">
-                      {platformInfo.logo
-                        ? <img src={platformInfo.logo} alt={platformInfo.name} style={{ width: 32, height: 32 }} />
-                        : <Text size="2xl">❓</Text>
-                      }
-                      <div>
-                        <Group gap="xs">
-                          <Text size="lg" fw={600}>{channel.name}</Text>
-                          <Badge variant="light" size="sm">
-                            {platformInfo.name}
-                          </Badge>
-                        </Group>
-                        <Group gap="xs" mt={8}>
-                          <Badge variant="light" size="sm" color={channel.enabled ? 'teal' : 'gray'}>
-                            {getChannelEnabledLabel(channel.enabled)}
-                          </Badge>
-                          {channel.channelId === 'feishu' && (
-                            <Badge
-                              variant="light"
-                              size="sm"
-                              color={getRuntimeBadgeColor(channel.runtimeState)}
-                            >
-                              {getRuntimeLabel(channel.runtimeState)}
-                            </Badge>
-                          )}
-                        </Group>
-                        {shouldShowPluginStatus(channel) && channel.pluginStatus && getVisiblePluginStatusStages(channel.pluginStatus).length > 0 && (
-                          <div className="mt-3 space-y-2">
-                            <Group gap="xs">
-                              {getVisiblePluginStatusStages(channel.pluginStatus).map((stage) => (
-                                <Badge
-                                  key={`${channel.id}:${stage.id}`}
-                                  variant="light"
-                                  size="sm"
-                                  color={getOfficialChannelStageColor(stage.state)}
-                                >
-                                  {getOfficialChannelStageLabel(stage.id)}
-                                </Badge>
-                              ))}
-                            </Group>
-                          </div>
-                        )}
-                      </div>
-                    </Group>
-                    <Group gap="xs">
-                      {channel.channelId === 'feishu' && channel.agentId && (
-                        <Button
-                          variant="light"
-                          size="sm"
-                          disabled={togglingAnyChannel}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            void handleOpenModelConfig(channel)
-                          }}
-                          className="cursor-pointer"
-                        >
-                          配置模型
-                        </Button>
-                      )}
-                      <Button
-                        color={channel.enabled ? 'orange' : 'teal'}
-                        variant="light"
-                        size="sm"
-                        disabled={togglingAnotherChannel}
-                        loading={isToggling}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          void handleToggleChannelEnabled(channel)
-                        }}
-                        className="cursor-pointer"
-                      >
-                        {channel.enabled ? '禁用' : '启用'}
-                      </Button>
-                      {channel.pairingRequired && (
-                        <Button
-                          variant="light"
-                          size="sm"
-                          disabled={togglingAnyChannel}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            handleOpenPairing(channel)
-                          }}
-                          className="cursor-pointer"
-                        >
-                          配对管理
-                        </Button>
-                      )}
-                      {channel.channelId === 'feishu' && channel.pairingAccountId && (
-                        <Button
-                          variant="light"
-                          size="sm"
-                          disabled={togglingAnyChannel}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            handleOpenDiagnostics(channel)
-                          }}
-                          className="cursor-pointer"
-                        >
-                          故障排查
-                        </Button>
-                      )}
-                      {shouldShowFeishuPluginRepairAction(channel) && (
-                        <Button
-                          variant="light"
-                          size="sm"
-                          disabled={togglingAnyChannel || (Boolean(repairingPluginChannelId) && repairingPluginChannelId !== channel.channelId)}
-                          loading={repairingPluginChannelId === channel.channelId}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            void handleRepairFeishuPlugin(channel)
-                          }}
-                          className="cursor-pointer"
-                        >
-                          修复飞书插件
-                        </Button>
-                      )}
-                      <Button
-                        color="red"
-                        variant="light"
-                        size="sm"
-                        disabled={togglingAnyChannel}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          void handleRemoveChannel(channel)
-                        }}
-                        className="cursor-pointer"
-                      >
-                        删除
-                      </Button>
-                    </Group>
-                  </Group>
-                </Card>
+                  channel={channel}
+                  platformInfo={platformInfo}
+                  isToggling={isToggling}
+                  togglingAnyChannel={togglingAnyChannel}
+                  togglingAnotherChannel={togglingAnotherChannel}
+                  repairingPluginChannelId={repairingPluginChannelId}
+                  onOpenModelConfig={() => void handleOpenModelConfig(channel)}
+                  onToggleEnabled={() => void handleToggleChannelEnabled(channel)}
+                  onOpenPairing={() => handleOpenPairing(channel)}
+                  onRepairPlugin={() => void handleRepairFeishuPlugin(channel)}
+                  onRename={() => handleOpenRename(channel)}
+                  onRemove={() => void handleRemoveChannel(channel)}
+                />
               )
             })
           )}
@@ -1082,10 +1006,42 @@ export default function ChannelsPage() {
           opened={showDiagnosticsModal}
           onClose={handleDiagnosticsClose}
           accountId={selectedDiagnosticsChannel.pairingAccountId}
-          botLabel={selectedDiagnosticsChannel.accountName || selectedDiagnosticsChannel.name}
+          botLabel={selectedDiagnosticsChannel.displayName}
           agentId={selectedDiagnosticsChannel.agentId}
         />
       )}
+
+      {/* 重命名 Modal */}
+      <Modal
+        opened={showRenameModal}
+        onClose={() => setShowRenameModal(false)}
+        title="重命名机器人"
+        size="sm"
+        centered
+      >
+        <TextInput
+          label="机器人名称"
+          placeholder="请输入新名称"
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') handleConfirmRename()
+          }}
+          autoFocus
+        />
+        <Group justify="flex-end" mt="md">
+          <Button variant="default" onClick={() => setShowRenameModal(false)}>
+            取消
+          </Button>
+          <Button
+            color="orange"
+            disabled={!renameValue.trim()}
+            onClick={handleConfirmRename}
+          >
+            确定
+          </Button>
+        </Group>
+      </Modal>
     </div>
   )
 }
