@@ -646,6 +646,14 @@ type ModelAuthAction =
 
 type AuthErrorCode = 'auth_busy' | 'invalid_input' | 'command_failed' | 'unsupported_capability'
 
+interface PostAuthRuntime {
+  tokenRotated: boolean
+  gatewayApplyAction: 'none' | 'hot-reload' | 'restart'
+  gatewayConfirmed: boolean
+  recoveryReason: 'none' | 'gateway-token-rotated' | 'gateway-recovery' | 'runtime-stale'
+  recommendedVerificationProfile: 'default' | 'post-auth-recovery' | 'slow-path'
+}
+
 interface RunModelAuthResult {
   ok: boolean
   action: ModelAuthAction['kind']
@@ -654,6 +662,7 @@ interface RunModelAuthResult {
   stderr: string
   code: number | null
   fallbackUsed: boolean
+  postAuthRuntime?: PostAuthRuntime
   errorCode?: AuthErrorCode
   message?: string
 }
@@ -1027,6 +1036,7 @@ type OpenClawGuardedWriteReason =
   | 'dashboard-add-feishu-bot'
   | 'dashboard-delete-feishu-bot'
   | 'managed-channel-plugin-repair'
+  | 'managed-plugin-config-reconcile'
   | 'pairing-allowfrom-sync'
   | 'gateway-port-recovery'
   | 'unknown'
@@ -1746,6 +1756,15 @@ interface ElectronApi {
   listWeixinAccounts: () => Promise<WeixinAccountState[]>
   removeWeixinAccount: (accountId: string) => Promise<{ ok: boolean }>
 
+  // Repair progress (Phase 4 unified notifications)
+  onRepairProgress: (listener: (payload: Record<string, any>) => void) => () => void
+  onRepairResult: (listener: (payload: Record<string, any>) => void) => () => void
+  getActiveRepairs: () => Promise<Record<string, any>[]>
+
+  // Update available notification (background checker → renderer)
+  onUpdateAvailable: (listener: (payload: QClawUpdateStatus & { source?: string }) => void) => () => void
+  checkQClawUpdateOnStartup: () => Promise<QClawUpdateStatus>
+
   // Channels
   channelsAdd: (channel: string, token: string) => Promise<CliResult>
   setupDingtalkOfficialChannel: (formData: Record<string, string>) => Promise<DingtalkOfficialSetupResult>
@@ -1848,7 +1867,10 @@ interface ElectronApi {
   getModelCapabilities: () => Promise<OpenClawCapabilities>
   listModelCatalog: (query?: ModelCatalogQuery) => Promise<ModelCatalogResult>
   getModelStatus: (options?: ModelStatusOptions) => Promise<ModelConfigCommandResult<Record<string, any>>>
-  getModelUpstreamState: () => Promise<{
+  getModelUpstreamState: (options?: {
+    timeoutMs?: number
+    loadTimeoutMs?: number
+  }) => Promise<{
     ok: boolean
     source: 'control-ui-app'
     data?: {
@@ -1948,6 +1970,8 @@ interface ElectronApi {
     kind: 'default' | 'agent-primary'
     model: string
     agentId?: string
+    timeoutMs?: number
+    loadTimeoutMs?: number
   }) => Promise<{
     ok: boolean
     wrote: boolean
@@ -1960,6 +1984,14 @@ interface ElectronApi {
   validateProviderCredential: (input: ValidateProviderCredentialInput) => Promise<ValidateProviderCredentialResult>
   applyModelConfig: (action: ModelConfigAction) => Promise<ModelConfigCommandResult<Record<string, any>>>
   runModelAuth: (action: ModelAuthAction) => Promise<RunModelAuthResult>
+  appendModelAuthDiagnosticLog: (entry: {
+    source: string
+    event: string
+    providerId?: string
+    methodId?: string
+    attemptId?: string | number
+    details?: Record<string, unknown>
+  }) => Promise<boolean>
   startModelOAuth: (request: StartModelOAuthRequest) => Promise<StartModelOAuthResult>
   cancelModelOAuth: () => Promise<boolean>
   onOAuthState: (listener: (payload: OAuthStateEventPayload) => void) => () => void

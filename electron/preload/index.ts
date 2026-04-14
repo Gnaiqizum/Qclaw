@@ -188,6 +188,18 @@ export const api = {
   listWeixinAccounts: () => ipcRenderer.invoke('weixin:accounts:list'),
   removeWeixinAccount: (accountId: string) => ipcRenderer.invoke('weixin:accounts:remove', accountId),
 
+  // Repair progress (Phase 4 unified notifications)
+  onRepairProgress: (listener: (payload: Record<string, any>) => void) =>
+    subscribeToChannel('managed-plugin:repair:progress', listener),
+  onRepairResult: (listener: (payload: Record<string, any>) => void) =>
+    subscribeToChannel('managed-plugin:repair:result', listener),
+  getActiveRepairs: () => ipcRenderer.invoke('managed-plugin:repair:active'),
+
+  // Update available notification (background checker → renderer)
+  onUpdateAvailable: (listener: (payload: Record<string, unknown>) => void) =>
+    subscribeToChannel('qclaw:update:available', listener),
+  checkQClawUpdateOnStartup: () => ipcRenderer.invoke('qclaw:update:check-on-startup'),
+
   // Channels
   channelsAdd: (channel: string, token: string) => ipcRenderer.invoke('channels:add', channel, token),
   setupDingtalkOfficialChannel: (formData: Record<string, string>) =>
@@ -253,7 +265,10 @@ export const api = {
   getModelCapabilities: () => ipcRenderer.invoke('models:capabilities:get'),
   listModelCatalog: (query?: Record<string, any>) => ipcRenderer.invoke('models:catalog:list', query),
   getModelStatus: (options?: Record<string, any>) => ipcRenderer.invoke('models:status:get', options),
-  getModelUpstreamState: () => ipcRenderer.invoke('models:upstream-state:get'),
+  getModelUpstreamState: (options?: { timeoutMs?: number; loadTimeoutMs?: number }) =>
+    options
+      ? ipcRenderer.invoke('models:upstream-state:get', options)
+      : ipcRenderer.invoke('models:upstream-state:get'),
   syncModelVerificationState: (input?: { statusData?: Record<string, any> | null }) =>
     ipcRenderer.invoke('models:verification:sync', input),
   recordModelVerification: (input: {
@@ -264,6 +279,8 @@ export const api = {
   validateProviderCredential: (input: Record<string, any>) => ipcRenderer.invoke('models:provider:validate', input),
   applyModelConfig: (action: Record<string, any>) => ipcRenderer.invoke('models:config:apply', action),
   runModelAuth: (action: Record<string, any>) => ipcRenderer.invoke('models:auth:run', action),
+  appendModelAuthDiagnosticLog: (entry: Record<string, any>) =>
+    ipcRenderer.invoke('model-auth:diagnostic:append', entry),
   startModelOAuth: (request: { providerId: string; methodId: string; selectedExtraOption?: string; setDefault?: boolean }) =>
     ipcRenderer.invoke('models:oauth:start', request),
   cancelModelOAuth: () => ipcRenderer.invoke('models:oauth:cancel'),

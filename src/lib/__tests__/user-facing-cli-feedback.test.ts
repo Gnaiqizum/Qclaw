@@ -67,7 +67,34 @@ describe('user-facing-cli-feedback', () => {
       fallback: 'fallback',
     })
 
-    expect(message).toBe('网关尚未就绪，请稍后重试。若持续失败，请重启网关后再试。')
+    expect(message).toBe('网关 token 已变更，请刷新后重新尝试')
+  })
+
+  it('maps raw token mismatch failures into the unified gateway wording instead of api-invalid copy', () => {
+    const message = toUserFacingCliFailureMessage({
+      stderr: 'token mismatch',
+      fallback: 'fallback',
+    })
+
+    expect(message).toBe('网关 token 已变更，请刷新后重新尝试')
+  })
+
+  it('keeps API-invalid wording for shared classifier hits', () => {
+    const message = toUserFacingCliFailureMessage({
+      stderr: 'status code 401: invalid api key',
+      fallback: 'fallback',
+    })
+
+    expect(message).toBe('API Key 无效、已过期或权限不足，请检查后重试。')
+  })
+
+  it('keeps generic network wording for shared classifier network hits', () => {
+    const message = toUserFacingCliFailureMessage({
+      stderr: 'fetch failed: proxy timeout',
+      fallback: 'fallback',
+    })
+
+    expect(message).toBe('网络连接异常，请检查网络或代理配置后重试。')
   })
 
   it('surfaces the busy skill mutation hint emitted by the main process marker', () => {
@@ -82,5 +109,14 @@ describe('user-facing-cli-feedback', () => {
 
     expect(message).toContain('当前正在安装 Skill：token-optimizer')
     expect(message).toContain('请等待当前 Skill 操作完成')
+  })
+
+  it('surfaces plugin quarantine failures before falling back to generic npm wording', () => {
+    const message = toUserFacingCliFailureMessage({
+      stderr: '插件导入 smoke test 失败：Cannot find package \'openclaw\'\n\n已自动隔离 1 个损坏插件并清理相关配置。',
+      fallback: '插件安装失败，请检查网络与 npm 环境后重试。',
+    })
+
+    expect(message).toBe('插件安装后未通过兼容性校验，已被自动隔离。请升级 Qclaw 或官方插件后重试。')
   })
 })

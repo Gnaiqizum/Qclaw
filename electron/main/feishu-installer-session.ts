@@ -15,15 +15,14 @@ import {
   setActiveProcess,
 } from './command-control'
 import { buildFeishuInstallerPromptHookScript } from './feishu-installer-prompt-hook'
-import { getOpenClawPaths, readConfig } from './cli'
+import { buildCommandCapabilityEnv, getOpenClawPaths, readConfig } from './cli'
 import { probePlatformCommandCapability } from './command-capabilities'
 import { applyConfigPatchGuarded } from './openclaw-config-coordinator'
+import { resolveManagedNpxCommand } from './managed-npx-command'
 import {
   FEISHU_OFFICIAL_PLUGIN_ID,
   prepareFeishuInstallerConfig,
 } from './feishu-installer-config'
-import { MAIN_RUNTIME_POLICY } from './runtime-policy'
-import { buildCliPathWithCandidates } from './runtime-path-discovery'
 import { resolveSafeWorkingDirectory } from './runtime-working-directory'
 import { cleanupIsolatedNpmCacheEnv, createIsolatedNpmCacheEnv } from './npm-cache-env'
 
@@ -441,18 +440,20 @@ export async function startFeishuInstallerSession(
     return buildSnapshot()
   }
 
-  const capability = await probePlatformCommandCapability('npx', {
+  const resolution = await resolveManagedNpxCommand({
+    buildEnv: buildCommandCapabilityEnv,
+    probeCapability: probePlatformCommandCapability,
     platform: process.platform,
-    env: process.env,
+    unavailableMessage: 'npx 命令不可用，无法启动飞书官方安装器。',
   })
-  if (!capability.available) {
+  if (!resolution.ok) {
     const errorSessionId = activeSession?.id || randomUUID()
     const commandResolution = buildFeishuInstallerCommand()
     return {
       active: false,
       sessionId: errorSessionId,
       phase: 'exited',
-      output: capability.message || 'npx 命令不可用，无法启动飞书官方安装器。',
+      output: resolution.result.stderr,
       code: 1,
       ok: false,
       canceled: false,
@@ -471,6 +472,10 @@ export async function startFeishuInstallerSession(
 
   try {
     const commandResolution = buildFeishuInstallerCommand()
+    const spawnCommand = [
+      resolution.command,
+      ...commandResolution.command.slice(1),
+    ]
     const promptHookPath = await ensureFeishuInstallerPromptHookFile()
     const promptBridgeServer = await createPromptBridgeServer(sessionToken)
     const promptBridgePort = resolvePromptBridgePort(promptBridgeServer)
@@ -478,18 +483,14 @@ export async function startFeishuInstallerSession(
     const diagEnabled = isFeishuInstallerDiagEnabled()
     const diagLogPath = diagEnabled ? await resolveFeishuInstallerDiagLogPath() : ''
 
-    const proc = spawn(commandResolution.command[0], commandResolution.command.slice(1), {
+    const proc = spawn(spawnCommand[0], spawnCommand.slice(1), {
       cwd: resolveSafeWorkingDirectory({
         env: process.env,
         platform: process.platform,
       }),
       env: {
         ...process.env,
-        PATH: buildCliPathWithCandidates({
-          platform: process.platform,
-          currentPath: process.env.PATH || '',
-          env: process.env,
-        }),
+        PATH: buildCommandCapabilityEnv().PATH,
         NO_COLOR: '1',
         FORCE_COLOR: '0',
         NODE_OPTIONS: appendNodeRequireOption(process.env.NODE_OPTIONS, promptHookPath),
@@ -503,11 +504,10 @@ export async function startFeishuInstallerSession(
             }
           : {}),
         ...isolatedNpmCache.env,
-      },
-      shell: process.platform === 'win32',
-      timeout: MAIN_RUNTIME_POLICY.cli.pluginInstallNpxTimeoutMs,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
+    },
+    shell: process.platform === 'win32',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
 
     activeSession = {
       id: sessionId,
@@ -519,7 +519,7 @@ export async function startFeishuInstallerSession(
       code: null,
       ok: false,
       canceled: false,
-      command: [...commandResolution.command],
+      command: [...spawnCommand],
       npmCacheDir: isolatedNpmCache.cacheDir,
       emit,
       pendingPrompt: null,
@@ -533,12 +533,12 @@ export async function startFeishuInstallerSession(
       sessionId,
       type: 'started',
       phase: 'running',
-      command: [...commandResolution.command],
+      command: [...spawnCommand],
       pendingPrompt: null,
     })
     void appendFeishuInstallerDiag('session-started', {
       sessionId,
-      command: [...commandResolution.command],
+      command: [...spawnCommand],
       promptBridgePort,
       diagLogPath,
       npmCacheDir: isolatedNpmCache.cacheDir,

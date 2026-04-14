@@ -18,6 +18,8 @@ import { isPluginAlreadyInstalledError } from '../../src/shared/openclaw-cli-err
 import { stripLegacyOpenClawRootKeys } from '../../src/shared/openclaw-config-sanitize'
 import { getManagedChannelPluginByChannelId } from '../../src/shared/managed-channel-plugin-registry'
 
+const DINGTALK_PLUGIN_INSTALL_REGISTRY_URL = 'https://registry.npmmirror.com'
+
 interface CliLikeResult {
   stdout?: string
   stderr?: string
@@ -177,6 +179,31 @@ async function sanitizeLegacyConfig(context: DingtalkOperationContext): Promise<
   return { ok: true }
 }
 
+/**
+ * Dingtalk-specific preflight hook for the unified preflight flow.
+ * Runs `openclaw doctor --fix --non-interactive` to clean up stale config.
+ */
+export async function dingtalkPreflightHook(context: {
+  homeDir: string
+  config: Record<string, any>
+}): Promise<{ ok: boolean; evidence?: string[]; error?: string }> {
+  const doctorResult = await runDoctor({ fix: true, nonInteractive: true })
+  if (!doctorResult.ok) {
+    return {
+      ok: false,
+      evidence: [
+        `openclaw doctor --fix --non-interactive exited with code ${doctorResult.code ?? 'null'}`,
+        ...(doctorResult.stderr ? [doctorResult.stderr] : []),
+      ],
+      error: '钉钉预检修复失败，请先处理历史污染配置后重试。',
+    }
+  }
+  return {
+    ok: true,
+    evidence: [`openclaw doctor --fix completed successfully`],
+  }
+}
+
 async function runDingtalkDoctorAndRepair(
   context: DingtalkOperationContext
 ): Promise<{ ok: true } | { ok: false; message: string; code: number }> {
@@ -255,7 +282,9 @@ async function ensureDingtalkPluginInstalled(
     }
   }
 
-  const installResult = await installPlugin(context.packageName, [context.pluginId])
+  const installResult = await installPlugin(context.packageName, [context.pluginId], {
+    registryUrl: DINGTALK_PLUGIN_INSTALL_REGISTRY_URL,
+  })
   pushOutput(context.outputParts, installResult)
 
   if (!installResult.ok) {
@@ -290,7 +319,7 @@ async function ensureDingtalkPluginInstalled(
     source: 'plugin-install',
     channelId: 'dingtalk',
     pluginId: context.pluginId,
-    command: `openclaw plugins install ${context.packageName}`,
+    command: `NPM_CONFIG_REGISTRY=${DINGTALK_PLUGIN_INSTALL_REGISTRY_URL} openclaw plugins install ${context.packageName}`,
     message: '已安装钉钉官方插件',
   })
 

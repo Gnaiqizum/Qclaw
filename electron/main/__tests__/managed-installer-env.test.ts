@@ -3,6 +3,7 @@ import {
   sanitizeManagedInstallerEnv,
   shouldDropManagedInstallerEnvKey,
 } from '../managed-installer-env'
+import { shouldRetryWithNpmTlsFallback } from '../cli'
 import { buildTestEnv } from './test-env'
 
 describe('managed-installer-env', () => {
@@ -39,5 +40,29 @@ describe('managed-installer-env', () => {
     expect(sanitized.npm_config_registry).toBeUndefined()
     expect(sanitized.NPM_CONFIG_CACHE).toBeUndefined()
     expect(sanitized.YARN_CACHE_FOLDER).toBeUndefined()
+  })
+
+  it('extends managed npm tls fallback coverage to plugin-install and weixin-installer npx commands', () => {
+    const tlsFailureResult = {
+      ok: false,
+      stdout: '',
+      stderr: 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+      code: 1,
+    }
+
+    expect(shouldRetryWithNpmTlsFallback('npx', tlsFailureResult, 'plugin-install')).toBe(true)
+    expect(shouldRetryWithNpmTlsFallback('npx.cmd', tlsFailureResult, 'weixin-installer')).toBe(true)
+  })
+
+  it('does not apply npm tls fallback to non-managed domains or non-npm commands', () => {
+    const tlsFailureResult = {
+      ok: false,
+      stdout: '',
+      stderr: 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+      code: 1,
+    }
+
+    expect(shouldRetryWithNpmTlsFallback('npx', tlsFailureResult, 'gateway')).toBe(false)
+    expect(shouldRetryWithNpmTlsFallback('brew', tlsFailureResult, 'plugin-install')).toBe(false)
   })
 })

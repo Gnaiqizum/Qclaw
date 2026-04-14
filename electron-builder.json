@@ -6,6 +6,7 @@
   "afterSign": "scripts/after-sign-notarize.cjs",
   "afterAllArtifactBuild": "scripts/after-all-artifact-build.cjs",
   "directories": {
+    "app": ".electron-builder/app",
     "output": "release/${env.QCLAW_DISPLAY_VERSION}"
   },
   "files": [
@@ -29,7 +30,7 @@
   "mac": {
     "icon": "build/icon.icns",
     "category": "public.app-category.developer-tools",
-    "artifactName": "Qclaw-Lite_${env.QCLAW_DISPLAY_VERSION}.${ext}",
+    "artifactName": "Qclaw-Lite_${env.QCLAW_DISPLAY_VERSION}-${arch}.${ext}",
     "hardenedRuntime": true,
     "gatekeeperAssess": false,
     "strictVerify": false,

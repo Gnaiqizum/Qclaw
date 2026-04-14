@@ -17,6 +17,10 @@ import SettingsPage from './pages/SettingsPage'
 import SkillsPage from './pages/SkillsPage'
 import AboutModal from './components/AboutModal'
 import GatewayBootstrapGate from './pages/GatewayBootstrapGate'
+import UpdateInterceptPage from './pages/UpdateInterceptPage'
+import { UpdateNotificationProvider } from './contexts/UpdateNotificationContext'
+import type { QClawUpdateStatus } from './shared/openclaw-phase4'
+import { resolveStartupUpdateReminderState } from './shared/qclaw-update-reminder'
 import {
   readTooltipEnabled,
   writeTooltipEnabled,
@@ -259,6 +263,10 @@ function buildPluginRepairRequestKey(options?: PluginRepairOptions): string {
     : `global${officialPolicyKey}${restorePolicyKey}`
 }
 
+export function shouldShowPluginRepairIntroNotification(trigger: 'startup' | 'manual'): boolean {
+  return trigger === 'manual'
+}
+
 function App() {
   const [appState, setAppState] = useState<AppState>('welcome')
   const [setupStep, setSetupStep] = useState<SetupStep>('api-keys')
@@ -275,6 +283,7 @@ function App() {
   const [showContactModal, setShowContactModal] = useState(false)
   const [pluginRepairRunning, setPluginRepairRunning] = useState(false)
   const [pluginRepairResult, setPluginRepairResult] = useState<PluginRepairResult | null>(null)
+  const [startupUpdateInfo, setStartupUpdateInfo] = useState<QClawUpdateStatus | null>(null)
   const [tooltipEnabled, setTooltipEnabled] = useState(() => readTooltipEnabled())
   const [chatComposerEnterSendMode, setChatComposerEnterSendMode] = useState(
     () => readChatComposerEnterSendMode()
@@ -326,29 +335,16 @@ function App() {
       }
     }
 
-    const activeCandidate =
-      normalizedResult?.candidates.find((candidate) => candidate.candidateId === normalizedResult.activeCandidateId) ||
-      null
-
     const nextTarget: 'setup' | 'dashboard' = summary.sharedConfigInitialized ? 'dashboard' : 'setup'
     setPendingPhase1Target(nextTarget)
     setPendingOpenUpdateCenter(false)
 
-    if (activeCandidate) {
-      const nextState = resolveAppStateForPhase1Target(nextTarget)
-      if (nextState === 'setup') {
-        setSetupStep('api-keys')
-        setSelectedPairingAccountId(undefined)
-        setSelectedPairingAccountName(undefined)
-        setSetupModelContext(null)
-        setAppState('setup')
-        return
-      }
+    // env-check 通过后先进入 update-intercept 阶段
+    setAppState('update-intercept')
+  }
 
-      setAppState(nextState)
-      return
-    }
-
+  const proceedAfterUpdateCheck = useCallback(() => {
+    const nextTarget = pendingPhase1Target || 'dashboard'
     const nextState = resolveAppStateForPhase1Target(nextTarget)
     if (nextState === 'setup') {
       setSetupStep('api-keys')
@@ -358,9 +354,8 @@ function App() {
       setAppState('setup')
       return
     }
-
     setAppState(nextState)
-  }
+  }, [pendingPhase1Target])
 
   const handleSetupComplete = () => {
     setSelectedPairingAccountId(undefined)
@@ -419,7 +414,7 @@ function App() {
       await activeTask.promise.catch(() => null)
     }
 
-    const loadingNotificationId = trigger === 'manual'
+    const loadingNotificationId = shouldShowPluginRepairIntroNotification(trigger)
       ? notifications.show({
           loading: true,
           autoClose: false,
@@ -428,15 +423,6 @@ function App() {
           message: PLUGIN_REPAIR_NOTICE_MESSAGE,
         })
       : null
-
-    if (trigger === 'startup') {
-      notifications.show({
-        color: 'blue',
-        title: '插件修复说明',
-        message: PLUGIN_REPAIR_NOTICE_MESSAGE,
-        autoClose: 4000,
-      })
-    }
 
     setPluginRepairRunning(true)
     const task = window.api.repairIncompatiblePlugins(normalizedOptions)
@@ -695,6 +681,33 @@ function App() {
     ))
   }
 
+  if (appState === 'update-intercept') {
+    return renderWithContactModal(renderFrame(
+      <UpdateInterceptPage
+        onCheckComplete={(status) => {
+          const { rememberedUpdate, shouldIntercept } = resolveStartupUpdateReminderState(
+            status,
+            localStorage.getItem('qclaw-update-skipped-version')
+          )
+          setStartupUpdateInfo(rememberedUpdate)
+          if (shouldIntercept) {
+            return // 留在拦截页
+          }
+          // 无更新 / 已跳过 / 超时 / 失败 → 继续原有流程
+          proceedAfterUpdateCheck()
+        }}
+        updateInfo={startupUpdateInfo}
+        onUpdate={() => { /* 由 UpdateInterceptPage 内部处理下载安装 */ }}
+        onSkip={() => {
+          if (startupUpdateInfo?.availableVersion) {
+            localStorage.setItem('qclaw-update-skipped-version', startupUpdateInfo.availableVersion)
+          }
+          proceedAfterUpdateCheck()
+        }}
+      />
+    ))
+  }
+
   if (appState === 'gateway-bootstrap') {
     return renderWithContactModal(renderFrame(
       <GatewayBootstrapGate
@@ -707,41 +720,43 @@ function App() {
   // Dashboard — now with sidebar layout
   if (appState === 'dashboard') {
     return renderWithContactModal(
-      <HashRouter>
-        <Routes>
-          <Route element={<MainLayout />}>
-            <Route index element={
-              <Dashboard
-                entrySnapshot={dashboardEntrySnapshot}
-                onReconfigure={handleReconfigure}
-                onOpenUpdateCenter={() => setUpdateCenterOpen(true)}
-                pluginRepairRunning={pluginRepairRunning}
-                pluginRepairResult={pluginRepairResult}
-              />
-            } />
-            <Route
-              path="/chat"
-              element={<ChatPage enterSendMode={chatComposerEnterSendMode} />}
-            />
-            <Route path="/channels" element={<ChannelsPage />} />
-            <Route path="/models" element={<ModelsPage />} />
-            <Route path="/skills" element={<SkillsPage />} />
-            <Route
-              path="/settings"
-              element={
-                <SettingsPage
+      <UpdateNotificationProvider initialUpdate={startupUpdateInfo}>
+        <HashRouter>
+          <Routes>
+            <Route element={<MainLayout />}>
+              <Route index element={
+                <Dashboard
+                  entrySnapshot={dashboardEntrySnapshot}
                   onReconfigure={handleReconfigure}
-                  onToggleTooltip={handleToggleTooltip}
-                  tooltipEnabled={tooltipEnabled}
-                  enterSendMode={chatComposerEnterSendMode}
-                  onChangeEnterSendMode={handleChangeChatComposerEnterSendMode}
+                  onOpenUpdateCenter={() => setUpdateCenterOpen(true)}
+                  pluginRepairRunning={pluginRepairRunning}
+                  pluginRepairResult={pluginRepairResult}
                 />
-              }
-            />
-          </Route>
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </HashRouter>
+              } />
+              <Route
+                path="/chat"
+                element={<ChatPage enterSendMode={chatComposerEnterSendMode} />}
+              />
+              <Route path="/channels" element={<ChannelsPage />} />
+              <Route path="/models" element={<ModelsPage />} />
+              <Route path="/skills" element={<SkillsPage />} />
+              <Route
+                path="/settings"
+                element={
+                  <SettingsPage
+                    onReconfigure={handleReconfigure}
+                    onToggleTooltip={handleToggleTooltip}
+                    tooltipEnabled={tooltipEnabled}
+                    enterSendMode={chatComposerEnterSendMode}
+                    onChangeEnterSendMode={handleChangeChatComposerEnterSendMode}
+                  />
+                }
+              />
+            </Route>
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </HashRouter>
+      </UpdateNotificationProvider>
     )
   }
 

@@ -182,6 +182,12 @@ describe('preload api model channels', () => {
     await api.getModelUpstreamState()
     expect(invokeMock).toHaveBeenLastCalledWith('models:upstream-state:get')
 
+    await api.getModelUpstreamState({ timeoutMs: 35_000, loadTimeoutMs: 30_000 })
+    expect(invokeMock).toHaveBeenLastCalledWith('models:upstream-state:get', {
+      timeoutMs: 35_000,
+      loadTimeoutMs: 30_000,
+    })
+
     await api.syncModelVerificationState({
       statusData: {
         allowed: ['openai/gpt-5.4-pro'],
@@ -206,6 +212,19 @@ describe('preload api model channels', () => {
     expect(invokeMock).toHaveBeenLastCalledWith('models:upstream-write:apply', {
       kind: 'default',
       model: 'openai/gpt-5.4-pro',
+    })
+
+    await api.applyModelConfigViaUpstream({
+      kind: 'default',
+      model: 'openai/gpt-5.4-pro',
+      timeoutMs: 35_000,
+      loadTimeoutMs: 30_000,
+    })
+    expect(invokeMock).toHaveBeenLastCalledWith('models:upstream-write:apply', {
+      kind: 'default',
+      model: 'openai/gpt-5.4-pro',
+      timeoutMs: 35_000,
+      loadTimeoutMs: 30_000,
     })
 
     await api.patchChatSessionModel({ sessionId: 'session-1', model: 'openai/gpt-5.4-pro' })
@@ -245,6 +264,17 @@ describe('preload api model channels', () => {
       kind: 'login',
       providerId: 'openai',
       methodId: 'openai-codex',
+    })
+
+    await api.appendModelAuthDiagnosticLog({
+      source: 'renderer:test',
+      event: 'sample',
+      providerId: 'zai',
+    })
+    expect(invokeMock).toHaveBeenLastCalledWith('model-auth:diagnostic:append', {
+      source: 'renderer:test',
+      event: 'sample',
+      providerId: 'zai',
     })
 
     await api.refreshModelData({

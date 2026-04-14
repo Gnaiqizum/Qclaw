@@ -1,5 +1,5 @@
-import { app, BrowserWindow, Menu, Notification, Tray, nativeImage, screen, shell } from 'electron'
-import { existsSync } from 'node:fs'
+import { app, autoUpdater, BrowserWindow, Menu, Notification, Tray, nativeImage, screen, shell } from 'electron'
+import { existsSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import os from 'node:os'
@@ -12,9 +12,13 @@ import {
   shouldDisableHardwareAccelerationForPlatform,
 } from '../../src/shared/desktop-window-policy'
 import { tryNormalizeProcessCwd } from './runtime-working-directory'
-import { revealWindow, showOrCreateWindow } from './window-lifecycle'
+import { deliverToWindowWhenReady, revealWindow, showOrCreateWindow } from './window-lifecycle'
+import { startBackgroundUpdateChecker } from './background-update-checker'
+import { checkQClawUpdate, getQClawUpdateStatus } from './qclaw-update-service'
+import { sendUpdateAvailable } from './renderer-notification-bridge'
 import { reloadGatewayForConfigChange } from './gateway-lifecycle-controller'
 import { sanitizeNodeOptionsForElectron } from './node-options'
+import { registerQuitIntentFromUpdater, shouldHideWindowOnClose } from './app-quit-state'
 import { attachMainWindowStatePersistence, loadMainWindowStateSync } from './window-state-store'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -58,6 +62,11 @@ const indexHtml = path.join(RENDERER_DIST, 'index.html')
 const focusApp = process.platform === 'darwin'
   ? (options: { steal: boolean }) => app.focus(options)
   : undefined
+
+registerQuitIntentFromUpdater(autoUpdater, () => {
+  isQuitting = true
+})
+
 function resolveRuntimeAppIconPath() {
   return app.isPackaged
     ? path.join(process.resourcesPath, 'app-icon.png')
@@ -129,7 +138,7 @@ function createWindow() {
   })
 
   browserWindow.on('close', (event) => {
-    if (process.platform !== 'darwin' || isQuitting) return
+    if (!shouldHideWindowOnClose(process.platform, isQuitting)) return
     event.preventDefault()
     browserWindow.hide()
   })
@@ -281,6 +290,53 @@ app.whenReady().then(() => {
   registerIpcHandlers()
   createWindow()
   createTray()
+
+  // 首次启动请求系统通知权限
+  if (Notification.isSupported()) {
+    const markerPath = path.join(app.getPath('userData'), '.notification-permission-requested')
+    if (!existsSync(markerPath)) {
+      new Notification({
+        title: 'Qclaw',
+        body: '通知已启用，新版本发布时将第一时间提醒您。',
+        silent: true,
+      }).show()
+      writeFileSync(markerPath, new Date().toISOString(), 'utf8')
+    }
+  }
+
+  // 启动后台版本检查器
+  startBackgroundUpdateChecker({
+    checkUpdate: checkQClawUpdate,
+    onUpdateAvailable: async (status) => {
+      const currentStatus = await getQClawUpdateStatus()
+      if (currentStatus.status === 'downloading' || currentStatus.status === 'installing') {
+        return
+      }
+
+      if (Notification.isSupported()) {
+        const n = new Notification({
+          title: '已发现 Qclaw 新版本',
+          body: `Qclaw ${status.availableVersion} 已发布，是否更新？`,
+          silent: true,
+        })
+        n.on('click', () => {
+          const result = showOrCreateWindow({
+            browserWindow: win,
+            createWindow,
+            focusApp,
+          })
+          win = result.window
+          deliverToWindowWhenReady(result.window, () => {
+            sendUpdateAvailable({ ...status, source: 'notification-click' })
+          })
+        })
+        n.show()
+      }
+
+      // 推送到渲染进程（更新侧边栏标记状态）
+      sendUpdateAvailable({ ...status, source: 'background' })
+    },
+  })
 })
 
 app.on('window-all-closed', () => {

@@ -22,7 +22,9 @@ const {
   getOpenClawPathsMock,
   issueDesiredRuntimeRevisionMock,
   markRuntimeRevisionInProgressMock,
+  notifyRepairResultMock,
   probeGatewayPortOwnerMock,
+  reloadGatewayForConfigChangeMock,
   repairManagedChannelPluginMock,
   repairDingtalkOfficialChannelMock,
   repairIncompatibleExtensionPluginsMock,
@@ -54,7 +56,9 @@ const {
   getOpenClawPathsMock: vi.fn(),
   issueDesiredRuntimeRevisionMock: vi.fn(),
   markRuntimeRevisionInProgressMock: vi.fn(),
+  notifyRepairResultMock: vi.fn(),
   probeGatewayPortOwnerMock: vi.fn(),
+  reloadGatewayForConfigChangeMock: vi.fn(),
   repairManagedChannelPluginMock: vi.fn(),
   repairDingtalkOfficialChannelMock: vi.fn(),
   repairIncompatibleExtensionPluginsMock: vi.fn(),
@@ -126,6 +130,14 @@ vi.mock('../managed-channel-plugin-lifecycle', () => ({
   repairManagedChannelPlugin: repairManagedChannelPluginMock,
 }))
 
+vi.mock('../gateway-lifecycle-controller', () => ({
+  reloadGatewayForConfigChange: reloadGatewayForConfigChangeMock,
+}))
+
+vi.mock('../managed-channel-repair-notifications', () => ({
+  notifyRepairResult: notifyRepairResultMock,
+}))
+
 vi.mock('../openclaw-runtime-reconcile', () => ({
   confirmRuntimeReconcile: confirmRuntimeReconcileMock,
   issueDesiredRuntimeRevision: issueDesiredRuntimeRevisionMock,
@@ -143,7 +155,7 @@ vi.mock('../../../src/shared/polling', () => ({
   pollWithBackoff: pollWithBackoffMock,
 }))
 
-import { ensureGatewayRunning } from '../openclaw-gateway-service'
+import { ensureGatewayRunning, _resetManagedChannelRepairCooldowns } from '../openclaw-gateway-service'
 
 describe('openclaw gateway service', () => {
   const tempDirs: string[] = []
@@ -163,6 +175,7 @@ describe('openclaw gateway service', () => {
   }
 
   beforeEach(async () => {
+    _resetManagedChannelRepairCooldowns()
     checkNodeMock.mockReset()
     checkOpenClawMock.mockReset()
     confirmRuntimeReconcileMock.mockReset()
@@ -178,7 +191,9 @@ describe('openclaw gateway service', () => {
     getOpenClawPathsMock.mockReset()
     issueDesiredRuntimeRevisionMock.mockReset()
     markRuntimeRevisionInProgressMock.mockReset()
+    notifyRepairResultMock.mockReset()
     probeGatewayPortOwnerMock.mockReset()
+    reloadGatewayForConfigChangeMock.mockReset()
     repairManagedChannelPluginMock.mockReset()
     repairDingtalkOfficialChannelMock.mockReset()
     repairIncompatibleExtensionPluginsMock.mockReset()
@@ -266,6 +281,15 @@ describe('openclaw gateway service', () => {
       kind: 'none',
       port: 18789,
       source: 'lsof',
+    })
+    reloadGatewayForConfigChangeMock.mockResolvedValue({
+      ok: true,
+      running: true,
+      stdout: 'reloaded',
+      stderr: '',
+      code: 0,
+      stateCode: 'healthy',
+      summary: '网关已重载并确认可用',
     })
     findAvailableLoopbackPortMock.mockResolvedValue(19876)
     gatewayStartMock.mockResolvedValue({
@@ -930,11 +954,169 @@ describe('openclaw gateway service', () => {
 
     const result = await ensureGatewayRunning()
 
-    expect(repairManagedChannelPluginMock).toHaveBeenNthCalledWith(1, 'wecom')
-    expect(repairManagedChannelPluginMock).toHaveBeenNthCalledWith(2, 'qqbot')
+    expect(repairManagedChannelPluginMock).toHaveBeenNthCalledWith(1, 'wecom', { skipGatewayReload: true })
+    expect(repairManagedChannelPluginMock).toHaveBeenNthCalledWith(2, 'qqbot', { skipGatewayReload: true })
     expect(runDoctorMock).not.toHaveBeenCalled()
     expect(result.ok).toBe(true)
     expect(result.running).toBe(true)
+  })
+
+  it('surfaces batch gateway reload failures after managed channel repair instead of falling through to later recovery paths', async () => {
+    readConfigMock
+      .mockResolvedValueOnce({
+        gateway: {
+          mode: 'local',
+        },
+        channels: {
+          wecom: {
+            enabled: true,
+            botId: 'bot_123',
+            secret: 'secret_456',
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        gateway: {
+          mode: 'local',
+        },
+        channels: {
+          wecom: {
+            enabled: true,
+            botId: 'bot_123',
+            secret: 'secret_456',
+          },
+        },
+        plugins: {},
+      })
+
+    gatewayHealthMock.mockResolvedValueOnce({
+      running: false,
+      raw: '',
+      stderr: [
+        'Config invalid',
+        '- channels.wecom: unknown channel id: wecom',
+      ].join('\n'),
+      code: 1,
+      stateCode: 'config_invalid',
+      summary: 'Config invalid',
+    })
+
+    repairManagedChannelPluginMock.mockResolvedValueOnce({
+      kind: 'ok',
+      channelId: 'wecom',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      action: 'installed',
+      status: {
+        channelId: 'wecom',
+        pluginId: 'wecom-openclaw-plugin',
+        summary: '企微插件已修复。',
+        stages: [],
+        evidence: [],
+      },
+    })
+
+    reloadGatewayForConfigChangeMock.mockResolvedValueOnce({
+      ok: false,
+      running: false,
+      stdout: '',
+      stderr: 'gateway reload failed',
+      code: 1,
+      stateCode: 'gateway_not_running',
+      summary: '批量修复后的网关重载失败',
+    })
+
+    const result = await ensureGatewayRunning()
+
+    expect(reloadGatewayForConfigChangeMock).toHaveBeenCalledWith(
+      'managed-channel-plugin-batch-repair',
+      { preferEnsureWhenNotRunning: true }
+    )
+    expect(gatewayStartMock).not.toHaveBeenCalled()
+    expect(runDoctorMock).not.toHaveBeenCalled()
+    expect(result.ok).toBe(false)
+    expect(result.running).toBe(false)
+    expect(result.stateCode).toBe('gateway_not_running')
+    expect(result.summary).toBe('批量修复后的网关重载失败')
+    expect(result.safeToRetry).toBe(true)
+    expect(notifyRepairResultMock).toHaveBeenCalledTimes(1)
+    expect(notifyRepairResultMock).toHaveBeenLastCalledWith({
+      kind: 'gateway-reload-failed',
+      channelId: 'wecom',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      reloadReason: '批量修复后的网关重载失败',
+      retryable: true,
+      failedPhase: 'gateway-reload',
+      status: {
+        channelId: 'wecom',
+        pluginId: 'wecom-openclaw-plugin',
+        summary: '企微插件已修复。',
+        stages: [],
+        evidence: [],
+      },
+    }, 'gateway-self-heal')
+  })
+
+  it('keeps batch reload failure non-retryable when reload classifies it as blocked', async () => {
+    gatewayHealthMock.mockResolvedValueOnce({
+      running: false,
+      raw: '',
+      stderr: '- channels.wecom: unknown channel id: wecom',
+      code: 1,
+      stateCode: 'config_invalid',
+      summary: 'Config invalid',
+    })
+
+    repairManagedChannelPluginMock.mockResolvedValueOnce({
+      kind: 'ok',
+      channelId: 'wecom',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      action: 'installed',
+      status: {
+        channelId: 'wecom',
+        pluginId: 'wecom-openclaw-plugin',
+        summary: '企微插件已修复。',
+        stages: [],
+        evidence: [],
+      },
+    })
+
+    reloadGatewayForConfigChangeMock.mockResolvedValueOnce({
+      ok: false,
+      running: false,
+      stdout: '',
+      stderr: 'authentication required: api key missing',
+      code: 1,
+      stateCode: 'auth_missing',
+      summary: '当前机器缺少可用的模型认证信息',
+    })
+
+    const result = await ensureGatewayRunning()
+
+    expect(result.ok).toBe(false)
+    expect(result.running).toBe(false)
+    expect(result.stateCode).toBe('auth_missing')
+    expect(result.safeToRetry).toBe(false)
+    expect(result.repairOutcome).toBe('blocked')
+    expect(notifyRepairResultMock).toHaveBeenCalledTimes(1)
+    expect(notifyRepairResultMock).toHaveBeenLastCalledWith({
+      kind: 'gateway-reload-failed',
+      channelId: 'wecom',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      reloadReason: '当前机器缺少可用的模型认证信息',
+      retryable: false,
+      failedPhase: 'gateway-reload',
+      status: {
+        channelId: 'wecom',
+        pluginId: 'wecom-openclaw-plugin',
+        summary: '企微插件已修复。',
+        stages: [],
+        evidence: [],
+      },
+    }, 'gateway-self-heal')
   })
 
   it('continues into the official doctor repair when managed channel repair still reports config_invalid', async () => {
@@ -1010,12 +1192,27 @@ describe('openclaw gateway service', () => {
 
     const result = await ensureGatewayRunning()
 
-    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('wecom')
+    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('wecom', { skipGatewayReload: true })
     expect(gatewayStartMock).not.toHaveBeenCalled()
     expect(runDoctorMock).toHaveBeenNthCalledWith(1, undefined)
     expect(runDoctorMock).toHaveBeenNthCalledWith(2, { fix: true })
     expect(result.ok).toBe(true)
     expect(result.running).toBe(true)
+    expect(notifyRepairResultMock).toHaveBeenCalledTimes(1)
+    expect(notifyRepairResultMock).toHaveBeenLastCalledWith({
+      kind: 'ok',
+      channelId: 'wecom',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      action: 'installed',
+      status: {
+        channelId: 'wecom',
+        pluginId: 'wecom-openclaw-plugin',
+        summary: '企微插件已修复。',
+        stages: [],
+        evidence: [],
+      },
+    }, 'gateway-self-heal')
   })
 
   it('matches dingtalk legacy channel aliases and delegates to the dedicated repair flow', async () => {
@@ -1079,7 +1276,7 @@ describe('openclaw gateway service', () => {
 
     const result = await ensureGatewayRunning()
 
-    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('dingtalk')
+    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('dingtalk', { skipGatewayReload: true })
     expect(result.ok).toBe(true)
     expect(result.running).toBe(true)
   })
@@ -1141,7 +1338,7 @@ describe('openclaw gateway service', () => {
 
     const result = await ensureGatewayRunning()
 
-    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('openclaw-weixin')
+    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('openclaw-weixin', { skipGatewayReload: true })
     expect(installPluginMock).toHaveBeenCalledWith(
       '@tencent-weixin/openclaw-weixin',
       ['openclaw-weixin']
@@ -1169,6 +1366,67 @@ describe('openclaw gateway service', () => {
     })
     expect(result.ok).toBe(true)
     expect(result.running).toBe(true)
+  })
+
+  it('does not emit a premature gateway-self-heal notification for weixin before the fallback install path finishes', async () => {
+    readConfigMock.mockResolvedValue({
+      gateway: {
+        mode: 'local',
+      },
+      channels: {
+        'openclaw-weixin': {
+          enabled: true,
+          accounts: {
+            'wx-account': {
+              enabled: true,
+            },
+          },
+        },
+      },
+      plugins: {},
+    })
+
+    isPluginInstalledOnDiskMock
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true)
+
+    gatewayHealthMock
+      .mockResolvedValueOnce({
+        running: false,
+        raw: '',
+        stderr: '- channels.openclaw-weixin: unknown channel id: openclaw-weixin',
+        code: 1,
+        stateCode: 'config_invalid',
+        summary: 'Config invalid',
+      })
+      .mockResolvedValueOnce({
+        running: true,
+        raw: '{"ok":true}',
+        stderr: '',
+        code: 0,
+        stateCode: 'healthy',
+        summary: 'Gateway healthy',
+      })
+
+    repairManagedChannelPluginMock.mockResolvedValueOnce({
+      kind: 'manual-action-required',
+      channelId: 'openclaw-weixin',
+      pluginScope: 'channel',
+      entityScope: 'account',
+      action: 'launch-interactive-installer',
+      reason: '该渠道需要交互式安装器，不能通过后台修复自动完成。',
+      status: {
+        channelId: 'openclaw-weixin',
+        pluginId: 'openclaw-weixin',
+        summary: '微信插件仍待交互式安装器完成安装。',
+        stages: [],
+        evidence: [],
+      },
+    })
+
+    await ensureGatewayRunning()
+
+    expect(notifyRepairResultMock).not.toHaveBeenCalled()
   })
 
   it('classifies post-weixin-self-heal startup failures from the new startup error instead of the stale initial config_invalid state', async () => {
@@ -1305,7 +1563,7 @@ describe('openclaw gateway service', () => {
 
     const result = await ensureGatewayRunning()
 
-    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('openclaw-weixin')
+    expect(repairManagedChannelPluginMock).toHaveBeenCalledWith('openclaw-weixin', { skipGatewayReload: true })
     expect(installPluginMock).toHaveBeenCalledWith(
       '@tencent-weixin/openclaw-weixin',
       ['openclaw-weixin']

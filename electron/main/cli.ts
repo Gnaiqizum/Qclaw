@@ -2,11 +2,15 @@
  * OpenClaw CLI wrapper — all interactions via spawn
  */
 import type { ChildProcess } from 'node:child_process'
-import { homedir, tmpdir, userInfo } from 'os'
-import { dirname, join, resolve as resolvePath } from 'path'
-import { access, readFile, writeFile, mkdir, stat, lstat, unlink } from 'fs/promises'
-import { createWriteStream, existsSync } from 'fs'
-import https from 'https'
+const os = process.getBuiltinModule('node:os') as typeof import('node:os')
+const path = process.getBuiltinModule('node:path') as typeof import('node:path')
+const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
+const fsPromises = process.getBuiltinModule('node:fs/promises') as typeof import('node:fs/promises')
+const https = process.getBuiltinModule('node:https') as typeof import('node:https')
+const { homedir, tmpdir, userInfo } = os
+const { dirname, join, resolve: resolvePath } = path
+const { access, readFile, writeFile, mkdir, stat, lstat, unlink } = fsPromises
+const { createWriteStream, existsSync } = fs
 import { atomicWriteJson } from './atomic-write'
 import { applyEnvFileUpdates } from './env-file'
 import { createOAuthOutputScanner, shouldAutoOpenBrowserForArgs } from './oauth-browser'
@@ -76,6 +80,7 @@ import {
 import { buildCliPathWithCandidates } from './runtime-path-discovery'
 import { inspectMacNodeInstaller, type NodeInstallerReadinessResult } from './node-installer-checks'
 import { isSkipConfigUnsupportedError, shouldTryLegacySkipConfig } from './plugin-install-npx'
+import { resolveManagedNpxCommand } from './managed-npx-command'
 import {
   DEFAULT_BUNDLED_NODE_REQUIREMENT,
   getBundledTargetNodeVersion,
@@ -697,16 +702,18 @@ async function runCliStreamingOnce(args: string[], options: RunCliStreamOptions 
   const timeout = options.timeout ?? MAIN_RUNTIME_POLICY.cli.defaultCommandTimeoutMs
   const commandProbeEnv = buildCommandCapabilityEnv()
   const explicitBinaryPath = String(options.binaryPath || '').trim()
+  const openClawCapability = !explicitBinaryPath
+    ? await probePlatformCommandCapability('openclaw', {
+        platform: process.platform,
+        env: commandProbeEnv,
+      })
+    : null
   if (!explicitBinaryPath) {
-    const openClawCapability = await probePlatformCommandCapability('openclaw', {
-      platform: process.platform,
-      env: commandProbeEnv,
-    })
-    if (!openClawCapability.available) {
+    if (!openClawCapability?.available) {
       return {
         ok: false,
         stdout: '',
-        stderr: openClawCapability.message || 'OpenClaw 命令行工具命令不可用',
+        stderr: openClawCapability?.message || 'OpenClaw 命令行工具命令不可用',
         code: 1,
       }
     }
@@ -751,7 +758,10 @@ async function runCliStreamingOnce(args: string[], options: RunCliStreamOptions 
       expectWarning: expectCapability?.message,
       scriptAvailable: scriptCapability?.available,
       scriptWarning: scriptCapability?.message,
-      commandPath: explicitBinaryPath || undefined,
+      commandPath:
+        explicitBinaryPath
+        || String(openClawCapability?.resolvedPath || '').trim()
+        || undefined,
     })
     const mergedEnv: NodeJS.ProcessEnv = {
       ...process.env,
@@ -856,6 +866,10 @@ type RunShellOptions = {
   controlDomain?: CommandControlDomain
   env?: Partial<NodeJS.ProcessEnv>
   shell?: boolean
+  detached?: boolean
+  onStdout?: (chunk: string) => void
+  onStderr?: (chunk: string) => void
+  onSpawn?: (proc: ChildProcess) => void
 }
 
 const NPM_TLS_FALLBACK_SANITIZE_KEYS = [
@@ -869,7 +883,12 @@ const NPM_TLS_CERT_FAILURE_PATTERN =
 const MAC_SYSTEM_CERT_FILE_PATH = '/etc/ssl/cert.pem'
 
 function shouldSanitizeManagedEnv(controlDomain: CommandControlDomain): boolean {
-  return controlDomain === 'env-setup' || controlDomain === 'upgrade'
+  return (
+    controlDomain === 'env-setup'
+    || controlDomain === 'upgrade'
+    || controlDomain === 'plugin-install'
+    || controlDomain === 'weixin-installer'
+  )
 }
 
 function sanitizeManagedEnv(
@@ -880,19 +899,25 @@ function sanitizeManagedEnv(
   return sanitizeManagedInstallerEnv(env)
 }
 
-function isNpmCommand(command: string): boolean {
+export function isNpmCommand(command: string): boolean {
   const normalized = String(command || '').trim().toLowerCase()
   return (
     normalized === 'npm' ||
+    normalized === 'npx' ||
     normalized === 'npm.cmd' ||
+    normalized === 'npx.cmd' ||
     normalized.endsWith('/npm') ||
+    normalized.endsWith('/npx') ||
     normalized.endsWith('\\npm') ||
+    normalized.endsWith('\\npx') ||
     normalized.endsWith('/npm.cmd') ||
-    normalized.endsWith('\\npm.cmd')
+    normalized.endsWith('/npx.cmd') ||
+    normalized.endsWith('\\npm.cmd') ||
+    normalized.endsWith('\\npx.cmd')
   )
 }
 
-function shouldRetryWithNpmTlsFallback(
+export function shouldRetryWithNpmTlsFallback(
   command: string,
   result: CliResult,
   controlDomain: CommandControlDomain
@@ -957,13 +982,23 @@ async function runShellOnce(
         env,
         cwd: normalizedOptions.cwd || resolveManagedSpawnCwd(),
         shell: forceOpenShell ? true : useShell,
+        detached: normalizedOptions.detached === true,
         timeout,
       })
       trackActiveProcess(proc, controlDomain)
+      normalizedOptions.onSpawn?.(proc)
       let stdout = ''
       let stderr = ''
-      proc.stdout?.on('data', (d) => (stdout += d.toString()))
-      proc.stderr?.on('data', (d) => (stderr += d.toString()))
+      proc.stdout?.on('data', (d) => {
+        const chunk = d.toString()
+        stdout += chunk
+        normalizedOptions.onStdout?.(chunk)
+      })
+      proc.stderr?.on('data', (d) => {
+        const chunk = d.toString()
+        stderr += chunk
+        normalizedOptions.onStderr?.(chunk)
+      })
       proc.on('close', (code) => {
         clearActiveProcessIfMatch(proc, controlDomain)
         const canceled = consumeCanceledProcess(proc, controlDomain)
@@ -1040,6 +1075,15 @@ export async function runShell(
   )
 }
 
+export async function runShellStreaming(
+  command: string,
+  args: string[],
+  timeout = MAIN_RUNTIME_POLICY.cli.defaultShellTimeoutMs,
+  options?: CommandControlDomain | RunShellOptions
+): Promise<CliResult> {
+  return runShell(command, args, timeout, options)
+}
+
 /** Run command without shell (for osascript etc.) */
 async function runDirectOnce(
   command: string,
@@ -1104,7 +1148,7 @@ export async function runDirect(
   )
 }
 
-function buildCommandCapabilityEnv(): NodeJS.ProcessEnv {
+export function buildCommandCapabilityEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
     PATH: buildCliPathWithCandidates({
@@ -3293,13 +3337,27 @@ export async function pairingRemoveAllowFrom(
 }
 
 /** Install a plugin: openclaw plugins install <name> */
-export async function installPlugin(name: string, expectedPluginIds: string[] = []): Promise<CliResult> {
+export async function installPlugin(
+  name: string,
+  expectedPluginIds: string[] = [],
+  options: {
+    registryUrl?: string | null
+  } = {}
+): Promise<CliResult> {
   const npmEnv = await createPluginInstallNpmEnv()
   try {
     const result = await runCliStreaming(['plugins', 'install', name], {
       timeout: MAIN_RUNTIME_POLICY.cli.pluginInstallTimeoutMs,
       controlDomain: 'plugin-install',
-      env: npmEnv.env,
+      env: {
+        ...npmEnv.env,
+        ...(String(options.registryUrl || '').trim()
+          ? {
+              npm_config_registry: String(options.registryUrl || '').trim(),
+              NPM_CONFIG_REGISTRY: String(options.registryUrl || '').trim(),
+            }
+          : {}),
+      },
     })
     const annotated = await annotatePluginPermissionFailure(result)
     return finalizePluginInstallResult(annotated, expectedPluginIds)
@@ -3349,13 +3407,21 @@ export async function channelsAdd(channel: string, token: string): Promise<CliRe
 
 /** Install plugin via npx (for official plugins like feishu) */
 export async function installPluginNpx(url: string, expectedPluginIds: string[] = []): Promise<CliResult> {
-  const capabilityError = await guardPlatformCommands(['npx'])
-  if (capabilityError) return capabilityError
+  const resolution = await resolveManagedNpxCommand({
+    buildEnv: buildCommandCapabilityEnv,
+    probeCapability: probePlatformCommandCapability,
+    platform: process.platform,
+    unavailableMessage: 'npx 命令不可用，无法安装插件。',
+  })
+  if (!resolution.ok) {
+    return resolution.result
+  }
+  const npxCommand = resolution.command
   const runNpxInstall = async (args: string[], registryUrl?: string | null) => {
     const npmEnv = await createPluginInstallNpmEnv()
     try {
       return await runShell(
-        'npx',
+        npxCommand,
         args,
         MAIN_RUNTIME_POLICY.cli.pluginInstallNpxTimeoutMs,
         {

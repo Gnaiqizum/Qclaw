@@ -49,6 +49,7 @@ import {
   cancelActiveCommand,
   cancelActiveCommands,
   prepareMacGitTools,
+  buildCommandCapabilityEnv,
 } from './cli'
 import { getModelCatalog, type ModelCatalogQuery } from './openclaw-model-catalog'
 import {
@@ -79,6 +80,7 @@ import { getOpenClawUpstreamModelState } from './openclaw-upstream-model-state'
 import { applyModelConfigViaUpstreamControlUi } from './openclaw-upstream-model-write'
 import { getModelVerificationState, recordModelVerification, syncModelVerificationState } from './model-verification-store'
 import { runAuthAction, type AuthAction } from './openclaw-auth-orchestrator'
+import { appendModelAuthDiagnosticLog } from './model-auth-diagnostic-log'
 import { startModelOAuthFlow, type StartModelOAuthRequest } from './model-oauth'
 import {
   getModelCenterCapabilities,
@@ -117,6 +119,7 @@ import { previewOpenClawRestore, runOpenClawRestore } from './openclaw-restore-s
 import { checkOpenClawUpgrade, runOpenClawUpgrade } from './openclaw-upgrade-service'
 import { readOpenClawRuntimeReconcileStore } from './openclaw-runtime-reconcile'
 import { withManagedOperationLock } from './managed-operation-lock'
+import { probePlatformCommandCapability } from './command-capabilities'
 import { buildAppleScriptDoShellScript } from './node-runtime'
 import type { FeishuBotDiagnosticSendRequest } from '../../src/shared/feishu-diagnostics'
 import {
@@ -128,6 +131,7 @@ import {
 } from './qclaw-update-service'
 import { checkCombinedUpdate, runCombinedUpdate } from './combined-update-orchestrator'
 import { wecomQrGenerate, wecomQrCheckResult } from './wecom-qr'
+import { parseClawHubSearchResults } from './clawhub-search'
 import {
   ensureGatewayReady,
   reloadGatewayForConfigChange,
@@ -168,6 +172,14 @@ import {
   prepareManagedChannelPluginForSetup,
   repairManagedChannelPlugin,
 } from './managed-channel-plugin-lifecycle'
+import { runManagedNpxCommand } from './managed-npx-command'
+
+const MANAGED_NPX_RUNNER_DEPENDENCIES = {
+  buildEnv: buildCommandCapabilityEnv,
+  probeCapability: probePlatformCommandCapability,
+  runShellImpl: runShell,
+  platform: process.platform,
+} as const
 import {
   clearChatTranscript,
   createChatSession,
@@ -413,11 +425,10 @@ async function installSkillWithOfficialFallback(skillSlug: string): Promise<CliR
   }
 
   const locations = resolveOpenClawSkillLocations(await getOpenClawSkillsListPayload())
-  return runShell(
-    'npx',
+  return runManagedNpxCommand(
     ['-y', 'clawhub', '--workdir', locations.workspaceDir, '--dir', 'skills', 'install', safeName],
-    120_000,
-    { cwd: locations.workspaceDir, controlDomain: 'plugin-install' }
+    { cwd: locations.workspaceDir, timeout: 120_000, controlDomain: 'plugin-install' },
+    MANAGED_NPX_RUNNER_DEPENDENCIES
   )
 }
 
@@ -616,6 +627,7 @@ export function registerIpcHandlers() {
   )
   ipcMain.handle('qclaw:update:status', () => getQClawUpdateStatus())
   ipcMain.handle('qclaw:update:check', () => checkQClawUpdate())
+  ipcMain.handle('qclaw:update:check-on-startup', () => checkQClawUpdate())
   ipcMain.handle('qclaw:update:download', () => downloadQClawUpdate())
   ipcMain.handle('qclaw:update:install', () => installQClawUpdate())
   ipcMain.handle('qclaw:update:open-download-url', () => openQClawUpdateDownloadUrl())
@@ -738,6 +750,9 @@ export function registerIpcHandlers() {
   ipcMain.handle('weixin:accounts:list', () => listWeixinAccountState())
   ipcMain.handle('weixin:accounts:remove', (_e, accountId: string) => removeWeixinAccountState(accountId))
 
+  // Repair progress (stub — real data wired in a later stage)
+  ipcMain.handle('managed-plugin:repair:active', () => [])
+
   // Channels
   ipcMain.handle('channels:add', (_e, channel: string, token: string) => channelsAdd(channel, token))
   ipcMain.handle('channels:dingtalk:setup-official', (_e, formData: Record<string, string>) =>
@@ -798,7 +813,9 @@ export function registerIpcHandlers() {
   ipcMain.handle('models:capabilities:get', () => getModelCenterCapabilities())
   ipcMain.handle('models:catalog:list', (_e, query?: ModelCatalogQuery) => getModelCatalog({ query }))
   ipcMain.handle('models:status:get', (_e, options?: ModelStatusOptions) => getModelStatus(options || {}))
-  ipcMain.handle('models:upstream-state:get', () => getOpenClawUpstreamModelState())
+  ipcMain.handle('models:upstream-state:get', (_e, options?: { timeoutMs?: number; loadTimeoutMs?: number }) =>
+    getOpenClawUpstreamModelState(options || {})
+  )
   ipcMain.handle('models:verification:sync', (_e, input?: { statusData?: Record<string, any> | null }) =>
     syncModelVerificationState(input || {})
   )
@@ -810,6 +827,20 @@ export function registerIpcHandlers() {
   ipcMain.handle('models:provider:validate', (_e, input: ValidateProviderCredentialInput) => validateProviderCredential(input))
   ipcMain.handle('models:config:apply', (_e, action: ModelConfigAction) => applyModelConfigAction(action))
   ipcMain.handle('models:auth:run', (_e, action: AuthAction) => runAuthAction(action))
+  ipcMain.handle('model-auth:diagnostic:append', async (_e, entry: Record<string, any>) => {
+    await appendModelAuthDiagnosticLog({
+      source: String(entry?.source || '').trim(),
+      event: String(entry?.event || '').trim(),
+      providerId: String(entry?.providerId || '').trim() || undefined,
+      methodId: String(entry?.methodId || '').trim() || undefined,
+      attemptId: entry?.attemptId,
+      details:
+        entry?.details && typeof entry.details === 'object' && !Array.isArray(entry.details)
+          ? entry.details
+          : undefined,
+    })
+    return true
+  })
   ipcMain.handle('models:oauth:start', (event, request: StartModelOAuthRequest) =>
     startModelOAuthFlow(request, {
       emit: (channel, payload) => {
@@ -958,11 +989,10 @@ export function registerIpcHandlers() {
       }
 
       // Try clawhub uninstall with the exact name
-      const r1 = await runShell(
-        'npx',
+      const r1 = await runManagedNpxCommand(
         buildClawHubUninstallArgs(safeName, locations),
-        undefined,
-        { cwd: locations.clawhubWorkdir, controlDomain: 'plugin-install' }
+        { cwd: locations.clawhubWorkdir, controlDomain: 'plugin-install' },
+        MANAGED_NPX_RUNNER_DEPENDENCIES
       )
       if (r1.ok) return r1
       // Try clawhub uninstall by scanning lock file for matching slug
@@ -971,11 +1001,10 @@ export function registerIpcHandlers() {
         const slugs = Object.keys(lock.skills || {})
         const safeMatch = findExactSafeSkillSlugMatch(safeName, slugs)
         if (safeMatch && safeMatch !== safeName) {
-          const r2 = await runShell(
-            'npx',
+          const r2 = await runManagedNpxCommand(
             buildClawHubUninstallArgs(safeMatch, locations),
-            undefined,
-            { cwd: locations.clawhubWorkdir, controlDomain: 'plugin-install' }
+            { cwd: locations.clawhubWorkdir, controlDomain: 'plugin-install' },
+            MANAGED_NPX_RUNNER_DEPENDENCIES
           )
           if (r2.ok) return r2
         }
@@ -997,21 +1026,13 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('clawhub:search', async (_e, query: string, limit = 10) => {
     const locations = await getOpenClawSkillLocations()
-    const result = await runShell(
-      'npx',
+    const result = await runManagedNpxCommand(
       ['-y', 'clawhub', 'search', query, '--limit', String(limit), '--registry', 'https://mirror-cn.clawhub.com'],
-      undefined,
-      { cwd: locations.clawhubWorkdir, controlDomain: 'plugin-install' }
+      { cwd: locations.clawhubWorkdir, controlDomain: 'plugin-install' },
+      MANAGED_NPX_RUNNER_DEPENDENCIES
     )
     if (!result.ok) return { ok: false, skills: [], error: result.stderr }
-    const skills: { slug: string; name: string; score: number }[] = []
-    for (const line of result.stdout.split('\n')) {
-      const match = line.match(/^(\S+)\s{2,}(.+?)\s{2,}\(([0-9.]+)\)/)
-      if (match) {
-        skills.push({ slug: match[1], name: match[2].trim(), score: parseFloat(match[3]) })
-      }
-    }
-    return { ok: true, skills }
+    return { ok: true, skills: parseClawHubSearchResults(result.stdout) }
   })
 
   ipcMain.handle('clawhub:install', async (_e, slug: string) => {
@@ -1112,10 +1133,18 @@ export function registerIpcHandlers() {
       }
 
       // 1. 尝试 npx（部分工具是 npm 包）
+      const capability = await probePlatformCommandCapability('npx', {
+        platform: process.platform,
+        env: buildCommandCapabilityEnv(),
+      })
+      const npxCommand = capability.available
+        ? String(capability.resolvedPath || '').trim() || 'npx'
+        : ''
       for (const bin of missingBins) {
         if (await verifyBin(bin)) continue
+        if (!npxCommand) break
         log(`尝试 npx -y ${bin} ...`)
-        await runShell('npx', ['-y', bin, '--version'], 60_000, 'env-setup')
+        await runShell(npxCommand, ['-y', bin, '--version'], 60_000, 'env-setup')
         if (await verifyBin(bin)) {
           log(`${bin} 已通过 npx 安装`)
         }

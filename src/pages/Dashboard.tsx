@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { Alert, ActionIcon, Button, Badge, Text, Group, Loader, Collapse, Modal, Progress, SegmentedControl, Tooltip } from '@mantine/core'
+import { Alert, ActionIcon, Button, Badge, Code, Text, Group, Loader, Collapse, Modal, Progress, SegmentedControl, Tooltip } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { IconChevronRight, IconRefresh } from '@tabler/icons-react'
 import { getChannelDefinition } from '../lib/openclaw-channel-registry'
@@ -7,6 +7,7 @@ import { getManagedChannelPluginByChannelId } from '../shared/managed-channel-pl
 import { pollWithBackoff } from '../shared/polling'
 import { UI_RUNTIME_DEFAULTS, type BackoffPollingPolicy } from '../shared/runtime-policies'
 import { runManagedChannelRepairFlow } from '../shared/managed-channel-repair'
+import { useRepairProgress } from '../hooks/useRepairProgress'
 import { runDashboardInitialLoad } from './dashboard-initial-load'
 import {
   buildModelCatalogDisplaySummary,
@@ -30,6 +31,7 @@ import {
   resolveRecordedModelVerificationStateFromSwitchResult,
   type ModelVerificationRecord,
 } from '../shared/model-verification-state'
+import { resolveManagedChannelIdentity } from '../shared/managed-channel-identity'
 import {
   getUpstreamCatalogItemsLike,
   getUpstreamModelStatusLike,
@@ -85,6 +87,15 @@ interface DashboardGatewayHealthLike {
   summary?: string
   stderr?: string
   raw?: string
+}
+
+interface DashboardGatewayReloadResultLike {
+  ok?: boolean
+  running?: boolean
+  stateCode?: unknown
+  summary?: string
+  stderr?: string
+  stdout?: string
 }
 
 type PluginRepairResult = Awaited<ReturnType<typeof window.api.repairIncompatiblePlugins>>
@@ -193,7 +204,7 @@ export const DASHBOARD_PLUGIN_ACTIONS: DashboardPluginActionDefinition[] = [
     channelName: '钉钉',
     buttonLabel: '修复钉钉插件',
     installKind: 'official-adapter',
-    installTarget: getManagedChannelPluginByChannelId('dingtalk')?.packageName || '@dingtalk-real-ai/dingtalk-connector',
+    installTarget: getManagedChannelPluginByChannelId('dingtalk')?.packageName || '@dingtalk-real-ai/dingtalk-connector@0.8.13',
     expectedPluginIds: [getManagedChannelPluginByChannelId('dingtalk')?.pluginId || 'dingtalk-connector'],
     repairMatchPluginIds: getManagedChannelPluginByChannelId('dingtalk')?.cleanupPluginIds || ['dingtalk-connector', 'dingtalk'],
   },
@@ -216,9 +227,61 @@ function isDashboardPluginCenterRepairableReloadState(stateCode: unknown): boole
   return stateCode === 'plugin_load_failure' || stateCode === 'config_invalid'
 }
 
-function hasVerifiedManagedChannelInstall(status: { stages: Array<{ id: string; state: string }> }): boolean {
-  return status.stages.some((stage) => stage.id === 'installed' && stage.state === 'verified')
-    && status.stages.some((stage) => stage.id === 'registered' && stage.state === 'verified')
+export function hasVerifiedManagedChannelInstall(
+  status: { stages: Array<{ id: string; state: string }> } | null | undefined
+): boolean {
+  const stages = status?.stages || []
+  return stages.some((stage) => stage.id === 'installed' && stage.state === 'verified')
+    && stages.some((stage) => stage.id === 'registered' && stage.state === 'verified')
+}
+
+interface DashboardGatewayReloadRecoveryApi {
+  ensureGatewayRunning: (options: { skipRuntimePrecheck: true }) => Promise<{
+    ok?: boolean
+    running?: boolean
+    summary?: string
+    stderr?: string
+    stdout?: string
+  }>
+  getManagedChannelPluginStatus: (channelId: string) => Promise<{
+    summary?: string
+    stages: Array<{ id: string; state: string }>
+  }>
+}
+
+export async function ensureDashboardPluginGatewayReadyAfterReload(
+  api: DashboardGatewayReloadRecoveryApi,
+  action: Pick<DashboardPluginActionDefinition, 'id' | 'channelName'>,
+  reloadResult: DashboardGatewayReloadResultLike,
+  appendLog: (line: string) => void
+): Promise<void> {
+  const gatewayReady = reloadResult.ok && reloadResult.running === true
+  if (gatewayReady) return
+
+  if (!isDashboardPluginCenterRepairableReloadState(reloadResult.stateCode)) {
+    throw new Error(
+      reloadResult.summary
+        || reloadResult.stderr
+        || reloadResult.stdout
+        || '网关重载失败'
+    )
+  }
+
+  appendLog(`⚠️ 网关重载命中可修复状态：${reloadResult.summary || reloadResult.stderr || '待继续复检'}`)
+  const ensureResult = await api.ensureGatewayRunning({ skipRuntimePrecheck: true })
+  if (!ensureResult.ok || ensureResult.running !== true) {
+    throw new Error(
+      ensureResult.summary
+        || ensureResult.stderr
+        || ensureResult.stdout
+        || '网关重载失败'
+    )
+  }
+
+  const targetStatus = await api.getManagedChannelPluginStatus(action.id)
+  if (!hasVerifiedManagedChannelInstall(targetStatus)) {
+    throw new Error(targetStatus.summary || `${action.channelName} 插件仍未确认安装`)
+  }
 }
 
 function buildWeixinInstallerOutcome(accountCount: number): DashboardPluginInstallOutcome {
@@ -429,13 +492,25 @@ function resolveDashboardActionErrorMessage(
 const DEFAULT_MODEL_SWITCH_FAILURE_MESSAGE = '默认模型切换失败，请稍后重试。'
 const DASHBOARD_PLUGIN_CENTER_FAILURE_MESSAGE = '插件处理失败，请稍后重试。'
 
-function extractChannelsFromConfig(config: Record<string, any> | null): ChannelInfo[] {
+export function extractChannelsFromConfig(config: Record<string, any> | null): ChannelInfo[] {
   if (!config || typeof config !== 'object') return []
-  return Object.entries(config.channels || {}).map(([id, cfg]: any) => ({
-    id,
-    name: cfg.name || id,
-    platform: cfg.domain || 'unknown',
-  }))
+  return Object.entries(config.channels || {}).map(([id, cfg]: any) => {
+    const channelConfig = (cfg || {}) as Record<string, any>
+    const normalizedPlatform =
+      (typeof channelConfig.domain === 'string' && channelConfig.domain.trim())
+      || (id === 'dingtalk-connector' ? 'dingtalk' : id)
+    const identity = resolveManagedChannelIdentity({
+      configChannelId: id,
+      platform: normalizedPlatform,
+    })
+    const channelDef = getChannelDefinition(identity.channelId) || getChannelDefinition(identity.platform)
+
+    return {
+      id,
+      name: channelConfig.name || channelDef?.name || identity.channelId || id,
+      platform: identity.platform,
+    }
+  })
 }
 
 export default function Dashboard({
@@ -480,6 +555,8 @@ export default function Dashboard({
   const [pluginCenterError, setPluginCenterError] = useState('')
   const [pluginCenterSummary, setPluginCenterSummary] = useState('')
   const [pluginCenterRepairResult, setPluginCenterRepairResult] = useState<PluginRepairResult | null>(null)
+
+  const { activeRepairs, lastResult: repairLastResult } = useRepairProgress()
 
   // 用于数据变化检测
   const prevChannelsRef = useRef<string>('')
@@ -1031,32 +1108,15 @@ export default function Dashboard({
       startPluginCenterProgressTimer(95, 98, 1, 220)
       if (shouldReloadGatewayAfterDashboardPluginInstall(action)) {
         const reloadResult = await window.api.reloadGatewayAfterChannelChange()
-        const gatewayReady = reloadResult.ok && reloadResult.running === true
-        if (!gatewayReady) {
-          if (isDashboardPluginCenterRepairableReloadState(reloadResult.stateCode)) {
-            appendPluginCenterLog(`⚠️ 网关重载命中可修复状态：${reloadResult.summary || reloadResult.stderr || '待继续复检'}`)
-            const ensureResult = await window.api.ensureGatewayRunning({ skipRuntimePrecheck: true })
-            if (!ensureResult.ok || ensureResult.running !== true) {
-              throw new Error(
-                ensureResult.summary
-                  || ensureResult.stderr
-                  || ensureResult.stdout
-                  || '网关重载失败'
-              )
-            }
-            const targetStatus = await window.api.getManagedChannelPluginStatus(action.id)
-            if (!hasVerifiedManagedChannelInstall(targetStatus)) {
-              throw new Error(targetStatus.summary || `${action.channelName} 插件仍未确认安装`)
-            }
-          } else {
-            throw new Error(
-              reloadResult.summary
-                || reloadResult.stderr
-                || reloadResult.stdout
-                || '网关重载失败'
-            )
-          }
-        }
+        await ensureDashboardPluginGatewayReadyAfterReload(
+          {
+            ensureGatewayRunning: (options) => window.api.ensureGatewayRunning(options),
+            getManagedChannelPluginStatus: (channelId) => window.api.getManagedChannelPluginStatus(channelId),
+          },
+          action,
+          reloadResult,
+          appendPluginCenterLog
+        )
       }
       await fetchGatewayStatus()
       await fetchConfig()
@@ -1229,6 +1289,28 @@ export default function Dashboard({
                 </Button>
               </Tooltip>
             </Group>
+            {activeRepairs.size > 0 && (
+              <Group gap="xs" mt={4}>
+                {Array.from(activeRepairs.values()).map((r) => (
+                  <Badge key={r.channelId} variant="light" color="blue" size="sm">
+                    正在修复 {r.channelId}...
+                  </Badge>
+                ))}
+              </Group>
+            )}
+            {repairLastResult && (repairLastResult.trigger === 'startup' || repairLastResult.trigger === 'gateway-self-heal') && (
+              <Text size="xs" c={repairLastResult.ok ? 'teal' : 'red'} mt={4}>
+                {repairLastResult.ok
+                  ? `自动修复完成: ${repairLastResult.summary}`
+                  : `自动修复失败: ${repairLastResult.summary}`}
+              </Text>
+            )}
+            {repairLastResult && !repairLastResult.ok && repairLastResult.manualCommand && (
+              <Alert color="orange" variant="light" title="手动修复" mt={4}>
+                <Text size="xs">自动修复失败，请在终端中运行以下命令手动安装：</Text>
+                <Code block mt={4}>{repairLastResult.manualCommand}</Code>
+              </Alert>
+            )}
           </div>
         </Collapse>
       </div>

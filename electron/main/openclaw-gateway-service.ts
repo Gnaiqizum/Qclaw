@@ -36,6 +36,7 @@ import {
   type CliResult,
   type GatewayHealthCheckResult,
 } from './cli'
+import { notifyRepairResult } from './managed-channel-repair-notifications'
 import { guardedWriteConfig } from './openclaw-config-guard'
 import { applyConfigPatchGuarded } from './openclaw-config-coordinator'
 import { findAvailableLoopbackPort, probeGatewayPortOwner } from './openclaw-gateway-probes'
@@ -116,6 +117,13 @@ const os = process.getBuiltinModule('node:os') as typeof import('node:os')
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 const CLAWHUB_RESOLUTION_FAILED_PATTERN = /resolving clawhub:[\s\S]*fetch failed/i
 const QCLAW_PLUGIN_NPM_CACHE_ROOT_DIR = path.join(os.tmpdir(), 'qclaw-lite', 'npm-cache')
+const NON_RETRYABLE_GATEWAY_BLOCKING_REASONS = new Set([
+  'upgrade_incompatible_config',
+  'machine_local_auth_missing',
+  'provider_plugin_not_ready',
+  'legacy_env_alias_detected',
+  'unknown_future_version',
+])
 
 function extractFirstNonEmptyLine(text: string): string {
   for (const line of String(text || '').split(/\r?\n/g)) {
@@ -485,6 +493,23 @@ function ensureManagedPluginAllowed(
   }
 }
 
+const MANAGED_CHANNEL_REPAIR_COOLDOWN_MS = 30_000
+const recentManagedChannelRepairs = new Map<string, number>()
+
+/** @internal — exposed for test isolation only */
+export function _resetManagedChannelRepairCooldowns(): void {
+  recentManagedChannelRepairs.clear()
+}
+
+function pruneExpiredRepairCooldowns(): void {
+  const now = Date.now()
+  for (const [channelId, timestamp] of recentManagedChannelRepairs) {
+    if (now - timestamp >= MANAGED_CHANNEL_REPAIR_COOLDOWN_MS) {
+      recentManagedChannelRepairs.delete(channelId)
+    }
+  }
+}
+
 async function tryRepairUnknownManagedChannels(
   options: EnsureGatewayRunningOptions,
   context: GatewayRecoveryContext,
@@ -495,8 +520,15 @@ async function tryRepairUnknownManagedChannels(
   blockingFailure: boolean
   health: GatewayHealthCheckResult
   summary: string
+  stateCode?: GatewayRuntimeStateCode
+  safeToRetry?: boolean
 } | null> {
+  pruneExpiredRepairCooldowns()
   const repairableRecords = extractUnknownManagedChannelRecords(sourceOutput)
+    .filter((record) => {
+      const lastRepairAt = recentManagedChannelRepairs.get(record.channelId)
+      return !lastRepairAt || Date.now() - lastRepairAt >= MANAGED_CHANNEL_REPAIR_COOLDOWN_MS
+    })
   if (repairableRecords.length === 0) {
     return null
   }
@@ -508,15 +540,38 @@ async function tryRepairUnknownManagedChannels(
     progress: 94,
   })
   const { repairManagedChannelPlugin } = await import('./managed-channel-plugin-lifecycle')
+  const successfulRepairs: Array<{
+    channelId: string
+    entityScope: 'channel' | 'account' | 'bot'
+    status: {
+      channelId: string
+      pluginId: string
+      summary: string
+      stages: any[]
+      evidence: any[]
+    }
+  }> = []
 
   for (const record of repairableRecords) {
+    recentManagedChannelRepairs.set(record.channelId, Date.now())
     recordGatewayAction(
       context,
       'install-plugin',
       ['managed-channel-plugin', 'repair', record.channelId]
     )
-    const repairResult = await repairManagedChannelPlugin(record.channelId)
+    const repairResult = await repairManagedChannelPlugin(record.channelId, { skipGatewayReload: true })
+    const shouldDeferRepairNotification =
+      repairResult.kind === 'ok'
+      || (record.channelId === 'openclaw-weixin' && repairResult.kind === 'manual-action-required')
+    if (!shouldDeferRepairNotification) {
+      notifyRepairResult(repairResult, 'gateway-self-heal')
+    }
     if (repairResult.kind === 'ok') {
+      successfulRepairs.push({
+        channelId: repairResult.channelId,
+        entityScope: repairResult.entityScope,
+        status: repairResult.status,
+      })
       continue
     }
 
@@ -537,6 +592,7 @@ async function tryRepairUnknownManagedChannels(
             message: summary,
             detail: summary,
           })
+          notifyRepairResult(repairResult, 'gateway-self-heal')
           return {
             handled: true,
             recovered: false,
@@ -554,6 +610,7 @@ async function tryRepairUnknownManagedChannels(
           message: repairResult.reason,
           detail: '当前 OpenClaw 配置读取失败，后台不会在未知配置上继续写入个人微信插件修复。',
         })
+        notifyRepairResult(repairResult, 'gateway-self-heal')
         return {
           handled: true,
           recovered: false,
@@ -576,6 +633,7 @@ async function tryRepairUnknownManagedChannels(
             message: summary,
             detail: '个人微信插件已补装，但受管配置写入失败，后台停止继续修复。',
           })
+          notifyRepairResult(repairResult, 'gateway-self-heal')
           return {
             handled: true,
             recovered: false,
@@ -645,6 +703,66 @@ async function tryRepairUnknownManagedChannels(
       health: createEmptyHealthCheck(),
       summary,
     }
+  }
+
+  // All managed channel plugins repaired with config writes batched (no individual reloads).
+  // Trigger a single gateway reload to apply all config changes at once.
+  const { reloadGatewayForConfigChange } = await import('./gateway-lifecycle-controller')
+  const reloadResult = await reloadGatewayForConfigChange('managed-channel-plugin-batch-repair', {
+    preferEnsureWhenNotRunning: true,
+  })
+  if (!reloadResult.ok || reloadResult.running !== true) {
+    const reloadClassification = classifyGatewayRuntimeState({
+      ...reloadResult,
+      ok: false,
+      running: false,
+    })
+    const reloadStateCode = (reloadResult.stateCode as GatewayRuntimeStateCode | undefined)
+      || reloadClassification.stateCode
+      || 'gateway_not_running'
+    const safeToRetry = NON_RETRYABLE_GATEWAY_BLOCKING_REASONS.has(
+      resolveGatewayBlockingReasonFromState({ gatewayStateCode: reloadStateCode })
+    )
+      ? false
+      : reloadClassification.safeToRetry
+    const summary = reloadResult.summary || reloadResult.stderr || '网关重载失败'
+    appendGatewayEvidence(context, {
+      source: 'config',
+      message: summary,
+      detail: '受管渠道插件批量修复已完成，但统一网关重载失败。',
+    })
+    for (const repair of successfulRepairs) {
+      notifyRepairResult({
+        kind: 'gateway-reload-failed',
+        channelId: repair.channelId,
+        pluginScope: 'channel',
+        entityScope: repair.entityScope,
+        reloadReason: summary,
+        retryable: safeToRetry,
+        failedPhase: 'gateway-reload',
+        status: repair.status,
+      }, 'gateway-self-heal')
+    }
+    return {
+      handled: true,
+      recovered: false,
+      blockingFailure: true,
+      health: createEmptyHealthCheck(),
+      summary,
+      stateCode: reloadStateCode,
+      safeToRetry,
+    }
+  }
+
+  for (const repair of successfulRepairs) {
+    notifyRepairResult({
+      kind: 'ok',
+      channelId: repair.channelId,
+      pluginScope: 'channel',
+      entityScope: repair.entityScope,
+      action: 'installed',
+      status: repair.status,
+    }, 'gateway-self-heal')
   }
 
   const repairedHealth = await safeGatewayHealth()
@@ -1639,10 +1757,10 @@ async function ensureGatewayRunningImpl(
         },
         context,
         {
-          stateCode: 'plugin_load_failure',
+          stateCode: managedChannelRepair.stateCode || 'plugin_load_failure',
           summary: managedChannelRepair.summary,
-          repairOutcome: 'blocked',
-          safeToRetry: false,
+          repairOutcome: (managedChannelRepair.safeToRetry ?? false) ? 'failed' : 'blocked',
+          safeToRetry: managedChannelRepair.safeToRetry ?? false,
           diagnostics: {
             lastHealth: managedChannelRepair.health,
             doctor: null,
